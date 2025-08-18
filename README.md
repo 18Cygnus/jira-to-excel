@@ -57,3 +57,28 @@ JIRA_FILTER_NAME=FilterName
 ```bash
 python jira_export.py
 ```
+
+## Scheduler Setup (schtasks)
+
+### 1. Open Command Line (CMD) in Administrator Mode
+Make sure to adjust the path with your own local path.
+```bash
+schtasks /Create ^
+  /SC DAILY /ST 11:00 ^
+  /TN "Jira Export to Excel" ^
+  /TR "\"C:\yourdirectory\jira-to-excel\.venv\Scripts\python.exe\" \"C:\yourdirectory\jira-to-excel\jira_export.py\" >> \"C:\yourdirectory\jira-to-excel\excels\run.log\" 2>&1" ^
+  /RL HIGHEST
+```
+- `/SC MINUTE /ST 11 ^` This will schedule the export at 11:00 WIB daily.
+
+### 2. Running or deleting the task
+Running the task :
+```bash
+schtasks /Run /TN "Jira Export to Excel"
+```
+
+Deleting the task if necessary:
+### 
+```bash
+schtasks /Delete /TN "Jira Export to Excel" /F
+```
