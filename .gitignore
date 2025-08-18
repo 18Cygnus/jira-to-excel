@@ -1,0 +1,13 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+# Environment variables
+.env
+
+# Python cache / compiled
+__pycache__/
+*.pyc
+
+# Virtual environment folder
+.venv/
+
+# Exported Excel files
+excels/
