@@ -11,3 +11,6 @@ __pycache__/
 
 # Exported Excel files
 excels/
+
+# Service account file
+service_account.json

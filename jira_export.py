@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 from datetime import datetime
 from pathlib import Path
 
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import set_with_dataframe
+
+
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -153,6 +158,7 @@ def format_duration(seconds: float) -> str:
     return f"{m} min {s} sec"
 
 def main():
+    print(f"=== Jira Export Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
     _require_env()
 
     # filter ID
@@ -189,6 +195,9 @@ def main():
     # sort & write to excel (sort by "created" column)
     if not df.empty:
         df.sort_values(by=["created"], ascending=False, inplace=True)
+    
+    # Update Google Sheets
+    push_to_gsheet(df)
 
     with pd.ExcelWriter(str(OUTPUT_FILE), engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Issues")
@@ -245,6 +254,130 @@ def main():
                 ws.cell(row=row, column=cols["due_date"]).number_format = 'mmm d, yyyy'
 
     print(f"Exported {len(issues)} issues to {OUTPUT_FILE}")
+    print(f"=== Jira Export Completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+    print()  # Add empty line for separation between runs
+
+def push_to_gsheet(df: pd.DataFrame):
+    """Push DataFrame to Google Sheets (overwrite)"""
+    gsheet_id = os.getenv("GSHEET_ID")
+    gsheet_ws = os.getenv("GSHEET_WORKSHEET", "Sheet1")
+    cred_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+
+    if not gsheet_id or not cred_file:
+        print("Google sheets env not set; skipping gsheet update")
+        return
+    
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets"
+        ]
+        creds = Credentials.from_service_account_file(cred_file, scopes=scopes)
+        gc = gspread.authorize(creds)
+
+        # Open the spreadsheet by ID
+        sh = gc.open_by_key(gsheet_id)
+        print(f"Successfully opened Google Sheet: {sh.title}")
+
+        # Get the first worksheet (index 0) regardless of name
+        ws = sh.get_worksheet(0)
+        print(f"Using worksheet: {ws.title}")
+
+        # Clear existing content and resize sheet if needed
+        ws.clear()
+        
+        # Calculate required dimensions
+        required_rows = len(df) + 1  # +1 for header
+        required_cols = len(df.columns)
+        
+        # Resize sheet if necessary
+        current_rows = ws.row_count
+        current_cols = ws.col_count
+        
+        if required_rows > current_rows or required_cols > current_cols:
+            new_rows = max(required_rows, current_rows)
+            new_cols = max(required_cols, current_cols)
+            print(f"Resizing sheet from {current_rows}x{current_cols} to {new_rows}x{new_cols}")
+            ws.resize(rows=new_rows, cols=new_cols)
+
+        # Convert all non-JSON serializable types to string with better formatting
+        df_copy = df.copy()
+        for col in df_copy.columns:
+            if col in ['created', 'updated']:
+                # Format datetime columns like "Sep 08, 2025, 2:55 PM"
+                df_copy[col] = df_copy[col].dt.strftime('%b %d, %Y, %I:%M %p')
+            elif col == 'due_date':
+                # Format date column like "Sep 08, 2025" 
+                df_copy[col] = df_copy[col].apply(
+                    lambda x: x.strftime('%b %d, %Y') if pd.notnull(x) else ''
+                )
+            elif df_copy[col].dtype == 'datetime64[ns]':
+                # Other datetime columns with standard format
+                df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            elif 'datetime' in str(df_copy[col].dtype):
+                df_copy[col] = df_copy[col].astype(str)
+            elif df_copy[col].dtype == 'object':
+                # Handle date objects and other non-serializable objects
+                df_copy[col] = df_copy[col].astype(str)
+
+        # Replace NaN/None values with empty strings
+        df_copy = df_copy.fillna('')
+
+        # Push DataFrame to Google Sheets in smaller chunks to avoid timeouts
+        print(f"Pushing {len(df_copy)} rows to Google Sheet...")
+        
+        # First, set headers (using new parameter order)
+        headers = [list(df_copy.columns)]
+        ws.update(values=headers, range_name='A1')
+        
+        # Then push data in chunks of 1000 rows
+        chunk_size = 1000
+        for i in range(0, len(df_copy), chunk_size):
+            chunk = df_copy.iloc[i:i+chunk_size]
+            start_row = i + 2  # +2 because row 1 is header and sheets are 1-indexed
+            
+            # Convert chunk to list of lists and ensure all values are JSON serializable
+            data = []
+            for _, row in chunk.iterrows():
+                row_data = []
+                for value in row:
+                    if pd.isna(value) or value is None:
+                        row_data.append('')
+                    else:
+                        row_data.append(str(value))
+                data.append(row_data)
+            
+            # Update the range (using new parameter order)
+            end_row = start_row + len(data) - 1
+            end_col_letter = chr(ord('A') + len(df_copy.columns) - 1)  # Calculate column letter
+            range_name = f'A{start_row}:{end_col_letter}{end_row}'
+            
+            ws.update(values=data, range_name=range_name)
+            print(f"Uploaded rows {start_row}-{end_row}")
+
+        # Apply formatting to make the spreadsheet look more professional
+        print("Applying formatting to the spreadsheet...")
+        
+        # Format header row (bold, background color)
+        header_range = f'A1:{chr(ord("A") + len(df_copy.columns) - 1)}1'
+        ws.format(header_range, {
+            "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
+            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True}
+        })
+        
+        # Auto-resize columns
+        # ws.columns_auto_resize(0, len(df_copy.columns) - 1)
+        
+        # Freeze header row
+        ws.freeze(rows=1)
+        
+        print("Formatting applied successfully!")
+
+        print(f"Successfully pushed {len(df)} rows to Google Sheet '{ws.title}'.")
+        print(f"Sheet URL: https://docs.google.com/spreadsheets/d/{sh.id}/edit")
+    
+    except Exception as e:
+        print(f"Failed to push to Google Sheets: {e}")
+        print("Continuing with Excel export only...")
 
 if __name__ == "__main__":
     main()

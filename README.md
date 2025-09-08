@@ -31,7 +31,7 @@ source .venv/Scripts/activate
 ```bash
 source .venv/bin/activate
 ```
-### 4. Install dependency
+### 4. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
@@ -58,7 +58,7 @@ JIRA_FILTER_NAME=FilterName
 python jira_export.py
 ```
 
-## Scheduler Setup (schtasks)
+## Scheduler Setup (schtasks) - Windows
 
 > [!WARNING]  
 > Please refrain from opening the exported Excel (.xlsx) file when the task is currently running to avoid export failure
@@ -69,10 +69,12 @@ Make sure to adjust the path with your own local path.
 schtasks /Create ^
   /SC DAILY /ST 11:00 ^
   /TN "Jira Export to Excel" ^
-  /TR "\"C:\yourdirectory\jira-to-excel\.venv\Scripts\python.exe\" \"C:\yourdirectory\jira-to-excel\jira_export.py\" >> \"C:\yourdirectory\jira-to-excel\excels\run.log\" 2>&1" ^
+  /TR "cmd /c \"cd /d C:\yourdirectory\jira-to-excel && C:\yourdirectory\jira-to-excel\.venv\Scripts\python.exe jira_export.py >> excels\run.log 2>&1\"" ^
   /RL HIGHEST
 ```
-- `/SC DAILY /ST 11 ^` This will schedule the export at 11:00 WIB daily.
+- `/SC DAILY /ST 11:00` This will schedule the export at 11:00 daily.
+- **Option 1** is more reliable and easier to debug
+- **Option 2** uses PowerShell for more complex command handling
 
 ### 2. Running or deleting the task
 Running the task :
@@ -81,7 +83,6 @@ schtasks /Run /TN "Jira Export to Excel"
 ```
 
 Deleting the task if necessary:
-### 
 ```bash
 schtasks /Delete /TN "Jira Export to Excel" /F
 ```
@@ -96,3 +97,48 @@ Windows Task Scheduler will not run a task if the computer is off at the schedul
 4. Enable “Run task as soon as possible after a scheduled start is missed” option.
 
 With this setting enabled, if the system is off at the scheduled time, the task will automatically run the next time the computer is turned on.
+
+# Google Spreadsheet Integration Setup  
+### 1. Activate Google Sheets API
+1. Open [Google Cloud Console](https://console.cloud.google.com/)
+2. Select project or create new and configure: <br/>- Fill in "Project Name" <br/>- Leave "Location/Organization" **empty**
+3. Go to **APIs & Services** → **Library**
+4. Find **Google Sheets API** → **Enable**
+
+### 2. Create Service Account
+1. In **APIs & Services** → click **Create Credentials** → choose **Application Data** → click Next
+2. Fill in **Name** (e.g: jira-export-service)
+3. After service account is created, open **Keys** tab → **Add Key** → **Create new key**.
+4. Choose **JSON** & download file <br/>- Save this file in local, e.g: `C:\directory\jira-to-excel\service_account.json` <br/>- Make sure to include this file inside **.gitignore**
+
+### 3. Create Spreadsheet & Grant Access to Google Sheet
+> [!IMPORTANT]  
+> Please start from a fresh/new spreadsheet
+1. Go to [Spreadsheet](https://docs.google.com/spreadsheets/u/0/) and create **New Spreadsheet**
+2. Open Spreadsheet e.g:
+`https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit`
+3. Click Share & Add Service Account email e.g: `jira-export-service@my-project.iam.gserviceaccount.com` as **Editor**. Find the email in [Service Account Tab](https://console.cloud.google.com/iam-admin/serviceaccounts)
+
+### 4. Update `.ENV`
+Add these variables in `.env`:
+```bash
+GSHEET_ID=<SPREADSHEET_ID>
+GSHEET_WORKSHEET=Issues
+GOOGLE_SERVICE_ACCOUNT_FILE=C:\YourDirectory\jira-to-excel\service_account.json
+```
+- GSHEET_ID = ID from spreadsheet's URL (between `/d/` and `/edit`)
+- GSHEET_WORKSHEET = worksheet tab's name (e.g: Issues)
+- GOOGLE_SERVICE_ACCOUNT_FILE = path to JSON key service account file
+
+### 5. Install Dependencies
+Inside your virtual environment (`.venv`), run:
+```bash
+pip install -r requirements.txt
+```
+
+### 6. Run the Exporter
+Run the script manually or wait for the scheduler. <br/>
+This python script will:
+- Fetch issues from Jira
+- Export to excels/jira_export.xlsx (`local`)
+- Overwrite Google Sheets' worksheet (`cloud`)
