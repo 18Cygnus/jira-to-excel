@@ -24,6 +24,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_FILTER_ID = os.getenv("JIRA_FILTER_ID")
 JIRA_FILTER_NAME = os.getenv("JIRA_FILTER_NAME")
+JIRA_JQL = os.getenv("JIRA_JQL")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 EXCEL_DIR = PROJECT_ROOT / "excels"
@@ -35,6 +36,7 @@ MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
 RETRY_429_SECONDS = 10
 OUTPUT_FILE = EXCEL_DIR / "jira_export.xlsx"
+BULK_FETCH_CHUNK = 100  # Jira bulk fetch limit
 
 SESSION = requests.Session()
 SESSION.auth = (JIRA_EMAIL, JIRA_API_TOKEN)
@@ -49,58 +51,81 @@ def _require_env():
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
     
-def find_filter_id_by_name(name: str) -> Optional[int]:
-    """
-    Uses /rest/api/3/filter/search to find a filter ID by name (exact match preferred).
-    """
-    url = f"{JIRA_BASE_URL}/rest/api/3/filter/search"
-    params = {"filterName": name}
-    r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Failed to find filter ID for '{name}': {r.status_code} {r.text}")
-    data = r.json()
-    candidates = data.get("values", [])
-    # prefer exact match, else first
-    for f in candidates:
-        if f.get("name") == name:
-            return int(f.get("id"))
-    if candidates:
-        return int(candidates[0].get("id"))
-    return None
+def _sleep_retry_after(resp):
+    retry_after = resp.headers.get("Retry-After")
+    try:
+        wait = int(retry_after) if retry_after else RETRY_429_SECONDS
+    except ValueError:
+        wait = RETRY_429_SECONDS
+    time.sleep(wait)
 
-def fetch_all_issues_for_filter(filter_id: int, fields: List[str]) -> List[Dict[str, Any]]:
+def search_issue_ids_by_jql(jql: str, max_results: int = MAX_RESULTS) -> List[str]:
     """
-    Paginates /rest/api/3/search with jql=filter<id>
+    Uses the new /rest/api/3/search/jql endpoint to collect issue IDs (or keys).
+    Paginates with nextPageToken.
     """
-    start_at = 0
-    issues: List[Dict[str, Any]] = []
+    url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
+    ids: List[str] = []
+    next_token: Optional[str] = None
 
     while True:
-        params = {
-            "jql": f"filter={filter_id}",
-            "startAt": start_at,
-            "maxResults": MAX_RESULTS,
-            "fields": ",".join(fields)
-        }
-        url = f"{JIRA_BASE_URL}/rest/api/3/search"
+        payload = {"jql": jql, "maxResults": max_results}
+        if next_token:
+            payload["nextPageToken"] = next_token
 
-        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if r.status_code == 429:
-            time.sleep(RETRY_429_SECONDS)
+            _sleep_retry_after(r)
             continue
         if r.status_code != 200:
-            raise RuntimeError(f"Failed to fetch issues for filter {filter_id}: {r.status_code} {r.text}")
+            raise RuntimeError(
+                f"Failed to search issue IDs via /search/jql: {r.status_code} {r.text}"
+            )
         
         data = r.json()
-        issues_page = data.get("issues", [])
-        issues.extend(issues_page)
+        issues = data.get("issues", [])
+        # New API returns only ids/keys unless fields were requested
+        for it in issues:
+            ids.append(it.get("id") or it.get("key"))
 
-        total = data.get("total", 0)
-        start_at += len(issues_page)
-        if start_at >= total or not issues_page:
+        next_token = data.get("nextPageToken")
+        if not next_token or not issues:
             break
 
-    return issues
+    return ids
+
+def bulk_fetch_issues(issue_ids_or_keys: List[str], fields: List[str]) -> List[Dict[str, Any]]:
+    """
+    Fetches full issue objects/fields via /rest/api/3/issue/bulkfetch in chunks
+    """
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/bulkfetch"
+    out: List[Dict[str, Any]] = []
+
+    for i in range(0, len(issue_ids_or_keys), BULK_FETCH_CHUNK):
+        chunk = issue_ids_or_keys[i:i+BULK_FETCH_CHUNK]
+        payload = {"issueIdsOrKeys": chunk, "fields": fields}
+
+        while True:
+            r = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429:
+                _sleep_retry_after(r)
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Bulk fetch failed (chunk {i}-{i+len(chunk)-1}): {r.status_code} {r.text}"
+                )
+            data = r.json()
+            out.extend(data.get("issues", []))
+            break
+
+    return out
+
+def fetch_all_issues(jql: str, fields: List[str]) -> List[Dict[str, Any]]:
+    """Collect issue IDs for the given JQL and bulk fetch their fields."""
+    ids = search_issue_ids_by_jql(jql, max_results=MAX_RESULTS)
+    if not ids:
+        return []
+    return bulk_fetch_issues(ids, fields)
 
 def dt_obj(dt_str):
     """
@@ -161,19 +186,29 @@ def main():
     print(f"=== Jira Export Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
     _require_env()
 
-    # filter ID
-    filter_id = None
-    if JIRA_FILTER_ID:
-        try:
-            filter_id = int(JIRA_FILTER_ID)
-        except ValueError:
-            raise RuntimeError("JIRA_FILTER_ID must be a number")
-    elif JIRA_FILTER_NAME:
-        filter_id = find_filter_id_by_name(JIRA_FILTER_NAME)
-        if filter_id is None:
-            raise RuntimeError(f"Filter '{JIRA_FILTER_NAME}' not found")
+    # determine source JQL
+    if JIRA_JQL and JIRA_JQL.strip():
+        active_jql = JIRA_JQL.strip()
+        source_label = f"JQL '{active_jql}'"
+        filter_id = None
     else:
-        raise RuntimeError("Provide JIRA_FILTER_ID or JIRA_FILTER_NAME in .env")
+        filter_id = None
+        if JIRA_FILTER_ID:
+            try:
+                filter_id = int(JIRA_FILTER_ID)
+            except ValueError:
+                raise RuntimeError("JIRA_FILTER_ID must be a number")
+        elif JIRA_FILTER_NAME:
+            filter_id = find_filter_id_by_name(JIRA_FILTER_NAME)
+            if filter_id is None:
+                raise RuntimeError(f"Filter '{JIRA_FILTER_NAME}' not found")
+        else:
+            raise RuntimeError("Provide JIRA_JQL or JIRA_FILTER_ID or JIRA_FILTER_NAME in .env")
+        active_jql = f"filter={filter_id}"
+        if JIRA_FILTER_NAME:
+            source_label = f"filter '{JIRA_FILTER_NAME}' (ID {filter_id})"
+        else:
+            source_label = f"filter ID {filter_id}"
     
     # choose the fields you want from Jira
     # include everything you use in flatten_issue()
@@ -182,9 +217,9 @@ def main():
         "created", "updated", "duedate", # change/remove if your instance differs
     ]
 
-    print(f"Fetching issues for filter ID {filter_id} ...")
+    print(f"Fetching issues for {source_label} ...")
     t0 = time.perf_counter() 
-    issues = fetch_all_issues_for_filter(filter_id, fields=fields)
+    issues = fetch_all_issues(active_jql, fields=fields)
     print(f"Fetched {len(issues)} issues")
     t_end = time.perf_counter()
     print(f"Total run time   : {format_duration(t_end - t0)}")
